@@ -44,7 +44,7 @@ Please sign up with a new user .[Here](https://docs.aws.amazon.com/cognito/lates
 In order for the solution to run end to end, the ALB created for Matchmaker and SignallingWebServer would need to expose https endpoints. Please upload/create required SSL certificates in ACM and link them to the ALB listeners.
 
 ## Cleanup ##
-
+Test
 To cleanup, please remove the lambda code and then delete the cloudformation stack
 
 ## Disclaimer ##
