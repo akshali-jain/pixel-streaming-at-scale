@@ -7,33 +7,33 @@ import time
 from boto3.dynamodb.conditions import Attr
 
 def lambda_handler(event, context):
-    print("=== HealthCoach CreateInstances Lambda STARTED ===")
+    print("=== 🚀 HealthCoach CreateInstances Lambda STARTED ===")
     print(f"Incoming event: {json.dumps(event)}")
 
     try:
         # === Step 1: Get configuration ===
         ssm = boto3.client('ssm')
-        print("Fetching concurrency limit and matchmaker IP from SSM...")
+        print("🔹 Fetching concurrency limit and matchmaker IP from SSM...")
 
         concurrency_limit = int(ssm.get_parameter(Name='HealthCoach-ConcurrencyLimit')['Parameter']['Value'])
         matchmaker_ip = ssm.get_parameter(Name='HealthCoach-MatchmakerIP')['Parameter']['Value']
 
-        print(f"Concurrency Limit: {concurrency_limit}")
-        print(f"Matchmaker IP: {matchmaker_ip}")
+        print(f"✅ Concurrency Limit: {concurrency_limit}")
+        print(f"✅ Matchmaker IP: {matchmaker_ip}")
 
-        # === Step 2: Setup EC2 and DynamoDB clients ===
+        # === Step 2: Setup EC2 and DynamoDB ===
         ec2 = boto3.client('ec2')
         dynamodb = boto3.resource('dynamodb')
         table_name = os.environ.get('DynamoDBName', 'HealthCoach-Production-SessionMapping')
         table = dynamodb.Table(table_name)
-        print(f"Using DynamoDB table: {table_name}")
+        print(f"✅ Using DynamoDB table: {table_name}")
 
-        # === Step 3: Random subnet logic ===
+        # === Step 3: Subnet selection ===
         all_subnets = [os.environ.get('SubnetIdPublicA'), os.environ.get('SubnetIdPublicB')]
         all_subnets = [s for s in all_subnets if s]
-        print(f"Available subnets: {all_subnets}")
+        print(f"✅ Available subnets: {all_subnets}")
 
-        # === Step 4: Build User Data Script ===
+        # === Step 4: Build user data ===
         user_data_script = f"""<powershell>
 Write-Host "Starting HealthCoach signalling instance..."
 Write-Host "Matchmaker IP: {matchmaker_ip}"
@@ -45,21 +45,20 @@ if (Test-Path "C:\\start-healthcoach.bat") {{
 }} else {{
     Write-Host "ERROR: start-healthcoach.bat not found!"
 }}
-Write-Host "Setup complete. Tagging instance as Ready."
-Stop-Transcript
+Write-Host "Setup complete."
 </powershell>"""
 
         user_data_encoded = base64.b64encode(user_data_script.encode('utf-8')).decode('utf-8')
-        print("UserData encoded successfully")
+        print("✅ UserData encoded successfully")
 
         # === Step 5: Launch Template setup ===
         launch_template_value = os.environ.get('LaunchTemplateName', 'HealthCoach-Production-UESignaling-LT')
         launch_template_key = 'LaunchTemplateId' if launch_template_value.startswith('lt-') else 'LaunchTemplateName'
-        print(f"LaunchTemplate key={launch_template_key}, value={launch_template_value}")
+        print(f"✅ LaunchTemplate key={launch_template_key}, value={launch_template_value}")
 
-        # === Step 6: Scheduled Mode (startAllServers) ===
+        # === Step 6: Scheduled startAllServers mode ===
         if "startAllServers" in event and event["startAllServers"]:
-            print("Scheduled mode: creating multiple instances...")
+            print("🕒 Scheduled mode: launching multiple instances...")
             response = ec2.run_instances(
                 LaunchTemplate={launch_template_key: launch_template_value, 'Version': '$Latest'},
                 MinCount=int(concurrency_limit),
@@ -67,22 +66,42 @@ Stop-Transcript
                 UserData=user_data_encoded,
                 SubnetId=random.choice(all_subnets)
             )
-            print(f"Created {concurrency_limit} instances.")
+            print(f"✅ Created {concurrency_limit} instances.")
             return {'statusCode': 200, 'body': json.dumps('All instances created successfully')}
 
-        # === Step 7: On-demand Mode ===
-        print("On-demand mode: checking DynamoDB for available slots...")
-        response = table.scan(FilterExpression=Attr('InstanceID').eq(''))
-        print(f"DynamoDB scan found {len(response['Items'])} available slots.")
+        # === Step 7: Check EC2 active instances ===
+        print("🔍 Checking currently running or pending instances...")
+        running_instances = ec2.describe_instances(
+            Filters=[
+                {'Name': 'tag:Application', 'Values': ['HealthCoach']},
+                {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+            ]
+        )
 
-        if len(response['Items']) == 0:
+        current_instance_count = sum(len(r['Instances']) for r in running_instances['Reservations'])
+        print(f"✅ Active HealthCoach instances: {current_instance_count}/{concurrency_limit}")
+
+        if current_instance_count >= concurrency_limit:
+            print("⚠️ Instance pool at full capacity! Skipping creation.")
+            return {
+                'statusCode': 400,
+                'body': json.dumps("Instance pool at capacity! Could not create new instance")
+            }
+
+        # === Step 8: DynamoDB check ===
+        print("🔍 Checking DynamoDB for available slots...")
+        response = table.scan(FilterExpression=Attr('InstanceID').eq(''))
+        available_slots = len(response['Items'])
+        print(f"✅ DynamoDB available slots: {available_slots}")
+
+        if available_slots == 0:
             print("⚠️ No available slots found — creating new instance anyway.")
         else:
-            print("✅ Slot available — proceeding to instance creation.")
+            print("✅ Found free slot — will assign instance after creation.")
 
-        # === Step 8: Launch new EC2 instance ===
+        # === Step 9: Launch new EC2 instance ===
         subnet_to_use = random.choice(all_subnets) if all_subnets else None
-        print(f"Launching new instance in subnet: {subnet_to_use}")
+        print(f"🧭 Launching new instance in subnet: {subnet_to_use}")
 
         launch_params = {
             'LaunchTemplate': {
@@ -106,16 +125,15 @@ Stop-Transcript
         if subnet_to_use:
             launch_params['SubnetId'] = subnet_to_use
 
-        print(f"Launching instance with params: {json.dumps(launch_params)}")
+        print(f"🚀 Launching instance with params: {json.dumps(launch_params)}")
         ec2_response = ec2.run_instances(**launch_params)
         instance_id = ec2_response['Instances'][0]['InstanceId']
-        print(f"✅ Created new EC2 instance: {instance_id}")
+        print(f"✅ EC2 Instance created: {instance_id}")
 
-        # === Step 9: Fetch instance IPs ===
-        def get_instance_details(instance_id, max_wait=30):
+        # === Step 10: Fetch instance IPs ===
+        def get_instance_details(instance_id, max_wait=45):
             waited = 0
             while waited < max_wait:
-                print(f"Waiting for instance details... {waited}s elapsed")
                 desc = ec2.describe_instances(InstanceIds=[instance_id])
                 instance = desc['Reservations'][0]['Instances'][0]
                 public_ip = instance.get('PublicIpAddress')
@@ -123,28 +141,29 @@ Stop-Transcript
                 state = instance['State']['Name']
                 if public_ip:
                     return public_ip, private_ip, state
+                print(f"⏳ Waiting for instance public IP... ({waited}s elapsed)")
                 time.sleep(3)
                 waited += 3
             return 'Pending', 'N/A', 'Unknown'
 
         public_ip, private_ip, state = get_instance_details(instance_id)
-        print(f"Instance ready — ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
+        print(f"✅ Instance ready: ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
 
-        # === Step 10: Update DynamoDB (optional) ===
-        if len(response['Items']) > 0:
-            item_key = response['Items'][0]['id'] if 'id' in response['Items'][0] else response['Items'][0]['TargetGroup']
-            print(f"Updating DynamoDB slot with InstanceID={instance_id}")
+        # === Step 11: Update DynamoDB if slot exists ===
+        if available_slots > 0:
+            item_key = response['Items'][0].get('id') or response['Items'][0].get('TargetGroup')
+            print(f"📝 Updating DynamoDB slot with InstanceID={instance_id} for key={item_key}")
             table.update_item(
                 Key={'TargetGroup': item_key},
                 UpdateExpression="SET InstanceID = :iid",
                 ExpressionAttributeValues={':iid': instance_id}
             )
 
-        # === Step 11: Return result ===
+        # === Step 12: Success response ===
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'New HealthCoach instance created successfully',
+                'message': '✅ New HealthCoach instance created successfully',
                 'InstanceId': instance_id,
                 'PrivateIp': private_ip,
                 'PublicIp': public_ip,
@@ -153,5 +172,8 @@ Stop-Transcript
         }
 
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps(f'Error creating instance: {str(e)}')}
+        print(f"❌ ERROR: {str(e)}", flush=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error creating instance: {str(e)}')
+        }
