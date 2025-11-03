@@ -1,100 +1,123 @@
-# this function is used to poll the SQS queue for new session request and then check if
-# a Signalling instance is already available to service the nequest or needs to be created
-# this function should be run on a schedule
+import json
 import boto3
-import json
 import os
-import json
-import logging
-import urllib.request
-import urllib.error
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
+import random
+import base64
+import time
+from boto3.dynamodb.conditions import Attr
+ 
 def lambda_handler(event, context):
-    
-    lambdaFunc=boto3.client('lambda')
-    
-    lambdaArnSendSesionDetails=''
-    lambdaArnCreateInstances=''
-    
-    response= lambdaFunc.get_function(
-        FunctionName='sendSessionDetails'
-        )
-    lambdaArnSendSesionDetails=response['Configuration']['FunctionArn']
-    response= lambdaFunc.get_function(
-        FunctionName='createInstances'
-        )
-    lambdaArnCreateInstances=response['Configuration']['FunctionArn']
-    response= lambdaFunc.get_function(
-        FunctionName='keepConnectionAlive'
-        )
-    lambdaArnKeepAlive=response['Configuration']['FunctionArn']
-    
-    ssm = boto3.client('ssm')
-    parameter = ssm.get_parameter(Name='matchmakerclientsecret')
-    matchmakersecret = parameter['Parameter']['Value']
-  
-    sqs = boto3.resource('sqs')
-    queue = sqs.get_queue_by_name(QueueName=os.environ["SQSName"])
-    for message in queue.receive_messages():
-        logger.info(message.body)
-        
-        payload=json.loads(message.body)
-        
-        # send a keep alive message to frontend
-        lambdaFunc.invoke(
-            FunctionName = lambdaArnKeepAlive,
-            InvocationType = 'RequestResponse',
-            Payload = json.dumps(payload)
-        )
-        
-        
-        logger.info("Connection id is "+payload["connectionId"])
-        logger.info("Endpoints id is "+os.environ["MatchMakerURL"] +". "+matchmakersecret)
-        # we make a call to matchmaker endpoint to check if a Signalling instance is available to service the request
-        try:
-            response = urllib.request.urlopen(urllib.request.Request(
-                url=os.environ["MatchMakerURL"],
-                headers={"clientsecret":matchmakersecret},
-                method='GET'),
-                timeout=5)
-          
-            if(response.status==200):
-                responsePayload=response.read()
-                JSON_object = json.loads(responsePayload.decode("utf-8"))
-                payload.update(JSON_object)
-            
-                # a 200 response from Matchmaker indicates a Signalling server is available to to service request.
-                # the matchmaker returns the Signalling server instanceID which is forwarded to sendSessionDetails
-                response = lambdaFunc.invoke(
-                    FunctionName = lambdaArnSendSesionDetails,
-                    InvocationType = 'RequestResponse',
-                    Payload = json.dumps(payload)
-                )
-            
-            message.delete()
-            logger.info("Found server to service request "+responsePayload.decode("utf-8"))
-            #break
-        except urllib.error.HTTPError as err:
-            if(err.code==400):
-                logger.info("No server to service request ")
-                inputParams = {
-                    "Key"   : "value"
-                }
-                # since no servers were found to service the request, we make a call to createInstance to create a new
-                # Signalling server in case we are not running on capacity
-                lambdaFunc.invoke(
-                    FunctionName = lambdaArnCreateInstances,
-                    InvocationType = 'Event',
-                    Payload = json.dumps(inputParams)
-                )
-                # noticed the message is not deleted here since we could not service it with a Signalling server instanceID
-            else:
-                raise err
-
-    return {
-        'statusCode': 200,
-        'body': json.dumps('Completed scanning for incoming requests')
-    }
+    """
+    Creates new HealthCoach UE+Signaling instances on demand
+    Triggered by: poller Lambda when no instances available
+    """
+    try:
+        # Get configuration from SSM
+        ssm = boto3.client('ssm')
+        concurrency_limit = int(ssm.get_parameter(Name='HealthCoach-ConcurrencyLimit')['Parameter']['Value'])
+        matchmaker_ip = ssm.get_parameter(Name='HealthCoach-MatchmakerIP')['Parameter']['Value']
+        # Check capacity in DynamoDB
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['DynamoDBName'])
+        response = table.scan(FilterExpression=Attr('InstanceID').eq(''))
+        if len(response['Items']) == 0:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Instance pool at capacity! Could not create new instance')
+            }
+        # UserData script for HealthCoach
+        user_data_script = f'''<powershell>
+# Set execution policy
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force
+ 
+# Create log file
+$logFile = "C:\\healthcoach-startup.log"
+Start-Transcript -Path $logFile
+ 
+Write-Host "Starting HealthCoach auto-scale instance..."
+ 
+# Get instance metadata
+$instanceId = Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/instance-id"
+$region = Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/placement/region"
+ 
+# Download HealthCoach deployment package from S3
+Write-Host "Downloading HealthCoach deployment package..."
+aws s3 sync s3://{os.environ.get('S3BucketName', 'healthcoach-deployment')}/HealthCoach-Deployment/ C:\\ --delete --region $region
+ 
+# Start HealthCoach services
+if (Test-Path "C:\\start-healthcoach.bat") {{
+    Write-Host "Starting HealthCoach services..."
+    (Get-Content "C:\\start-healthcoach.bat") -replace '%MATCHMAKER_IP%', '{matchmaker_ip}' | Set-Content "C:\\start-healthcoach.bat"
+    Start-Process -FilePath "C:\\start-healthcoach.bat" -NoNewWindow -Wait
+}} else {{
+    Write-Host "ERROR: start-healthcoach.bat not found!"
+}}
+ 
+# Tag instance as ready
+aws ec2 create-tags --resources $instanceId --tags Key=Status,Value=Ready --region $region
+ 
+Write-Host "HealthCoach instance deployment completed!"
+Stop-Transcript
+</powershell>'''
+        # Encode UserData
+        user_data_encoded = base64.b64encode(user_data_script.encode('utf-8')).decode('utf-8')
+        # Create new instance
+        ec2 = boto3.client('ec2')
+        launch_template_value = os.environ.get('LaunchTemplateName', 'HealthCoach-Production-UESignaling-LT')
+        if launch_template_value.startswith('lt-'):
+            launch_template_key = 'LaunchTemplateId'
+        else:
+            launch_template_key = 'LaunchTemplateName'
+        launch_params = {
+            'LaunchTemplate': {
+                launch_template_key: launch_template_value,
+                'Version': '$Latest'
+            },
+            'MinCount': 1,
+            'MaxCount': 1,
+            'UserData': user_data_encoded,
+            'TagSpecifications': [{
+                'ResourceType': 'instance',
+                'Tags': [
+                    {'Key': 'Name', 'Value': 'HealthCoach-UESignaling-Auto'},
+                    {'Key': 'Type', 'Value': 'signalling'},
+                    {'Key': 'Application', 'Value': 'HealthCoach'},
+                    {'Key': 'CreatedBy', 'Value': 'Lambda-AutoScale'}
+                ]
+            }]
+        }
+        response = ec2.run_instances(**launch_params)
+        instance_id = response['Instances'][0]['InstanceId']
+        print(f"Created new HealthCoach instance: {instance_id}")
+        # ✅ NEW: Wait for Public/Private IPs (retry loop up to 20 seconds)
+        def get_instance_details(instance_id, max_wait=20):
+            waited = 0
+            while waited < max_wait:
+                desc = ec2.describe_instances(InstanceIds=[instance_id])
+                instance = desc['Reservations'][0]['Instances'][0]
+                public_ip = instance.get('PublicIpAddress')
+                private_ip = instance.get('PrivateIpAddress')
+                state = instance['State']['Name']
+                if public_ip:
+                    return public_ip, private_ip, state
+                time.sleep(2)
+                waited += 2
+            return instance.get('PublicIpAddress', 'Pending'), instance.get('PrivateIpAddress', 'N/A'), instance['State']['Name']
+        public_ip, private_ip, state = get_instance_details(instance_id)
+        print(f"Instance ready: ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'New HealthCoach instance created successfully',
+                'InstanceId': instance_id,
+                'PrivateIp': private_ip,
+                'PublicIp': public_ip,
+                'State': state
+            })
+        }
+    except Exception as e:
+        print(f"Error creating instance: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error creating instance: {str(e)}')
+        }
