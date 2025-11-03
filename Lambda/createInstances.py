@@ -7,57 +7,82 @@ import time
 from boto3.dynamodb.conditions import Attr
 
 def lambda_handler(event, context):
-    print("=== createInstances Lambda started ===")
+    print("=== HealthCoach CreateInstances Lambda STARTED ===")
     print(f"Incoming event: {json.dumps(event)}")
 
     try:
-        # Step 1: Get configuration
-        print("Initializing SSM client")
+        # === Step 1: Get configuration ===
         ssm = boto3.client('ssm')
+        print("Fetching concurrency limit and matchmaker IP from SSM...")
 
-        print("Fetching concurrency limit from SSM")
-        concurrency_limit = ssm.get_parameter(Name='HealthCoach-ConcurrencyLimit')['Parameter']['Value']
-        print(f"Concurrency limit: {concurrency_limit}")
-
-        print("Fetching Matchmaker IP from SSM")
+        concurrency_limit = int(ssm.get_parameter(Name='HealthCoach-ConcurrencyLimit')['Parameter']['Value'])
         matchmaker_ip = ssm.get_parameter(Name='HealthCoach-MatchmakerIP')['Parameter']['Value']
+
+        print(f"Concurrency Limit: {concurrency_limit}")
         print(f"Matchmaker IP: {matchmaker_ip}")
 
-        # Step 2: DynamoDB
-        print("Initializing DynamoDB resource")
+        # === Step 2: Setup EC2 and DynamoDB clients ===
+        ec2 = boto3.client('ec2')
         dynamodb = boto3.resource('dynamodb')
-        table_name = os.environ.get('DynamoDBName')
+        table_name = os.environ.get('DynamoDBName', 'HealthCoach-Production-SessionMapping')
+        table = dynamodb.Table(table_name)
         print(f"Using DynamoDB table: {table_name}")
 
-        table = dynamodb.Table(table_name)
-        print("Scanning DynamoDB for empty InstanceIDs")
+        # === Step 3: Random subnet logic ===
+        all_subnets = [os.environ.get('SubnetIdPublicA'), os.environ.get('SubnetIdPublicB')]
+        all_subnets = [s for s in all_subnets if s]
+        print(f"Available subnets: {all_subnets}")
+
+        # === Step 4: Build User Data Script ===
+        user_data_script = f"""<powershell>
+Write-Host "Starting HealthCoach signalling instance..."
+Write-Host "Matchmaker IP: {matchmaker_ip}"
+aws s3 sync s3://{os.environ.get('S3BucketName', 'healthcoach-deployment')}/HealthCoach-Deployment/ C:\\ --delete
+if (Test-Path "C:\\start-healthcoach.bat") {{
+    Write-Host "Starting HealthCoach service..."
+    (Get-Content "C:\\start-healthcoach.bat") -replace '%MATCHMAKER_IP%', '{matchmaker_ip}' | Set-Content "C:\\start-healthcoach.bat"
+    Start-Process -FilePath "C:\\start-healthcoach.bat" -NoNewWindow -Wait
+}} else {{
+    Write-Host "ERROR: start-healthcoach.bat not found!"
+}}
+Write-Host "Setup complete. Tagging instance as Ready."
+Stop-Transcript
+</powershell>"""
+
+        user_data_encoded = base64.b64encode(user_data_script.encode('utf-8')).decode('utf-8')
+        print("UserData encoded successfully")
+
+        # === Step 5: Launch Template setup ===
+        launch_template_value = os.environ.get('LaunchTemplateName', 'HealthCoach-Production-UESignaling-LT')
+        launch_template_key = 'LaunchTemplateId' if launch_template_value.startswith('lt-') else 'LaunchTemplateName'
+        print(f"LaunchTemplate key={launch_template_key}, value={launch_template_value}")
+
+        # === Step 6: Scheduled Mode (startAllServers) ===
+        if "startAllServers" in event and event["startAllServers"]:
+            print("Scheduled mode: creating multiple instances...")
+            response = ec2.run_instances(
+                LaunchTemplate={launch_template_key: launch_template_value, 'Version': '$Latest'},
+                MinCount=int(concurrency_limit),
+                MaxCount=int(concurrency_limit),
+                UserData=user_data_encoded,
+                SubnetId=random.choice(all_subnets)
+            )
+            print(f"Created {concurrency_limit} instances.")
+            return {'statusCode': 200, 'body': json.dumps('All instances created successfully')}
+
+        # === Step 7: On-demand Mode ===
+        print("On-demand mode: checking DynamoDB for available slots...")
         response = table.scan(FilterExpression=Attr('InstanceID').eq(''))
-        print(f"DynamoDB scan response: {json.dumps(response)}")
+        print(f"DynamoDB scan found {len(response['Items'])} available slots.")
 
         if len(response['Items']) == 0:
-            print("No available slots found in table — at capacity.")
-            return {
-                'statusCode': 400,
-                'body': json.dumps('Instance pool at capacity! Could not create new instance')
-            }
+            print("⚠️ No available slots found — creating new instance anyway.")
+        else:
+            print("✅ Slot available — proceeding to instance creation.")
 
-        # Step 3: Build EC2 user data
-        print("Building EC2 user_data script")
-        user_data_script = f"""<powershell>
-Write-Host "Starting HealthCoach auto-scale instance..."
-# Matchmaker IP: {matchmaker_ip}
-</powershell>"""
-        user_data_encoded = base64.b64encode(user_data_script.encode('utf-8')).decode('utf-8')
-        print("User data encoded successfully")
-
-        # Step 4: Launch EC2
-        print("Initializing EC2 client")
-        ec2 = boto3.client('ec2')
-
-        launch_template_value = os.environ.get('LaunchTemplateName', 'HealthCoach-Production-UESignaling-LT')
-        print(f"Launch template from env: {launch_template_value}")
-        launch_template_key = 'LaunchTemplateId' if launch_template_value.startswith('lt-') else 'LaunchTemplateName'
-        print(f"Launch template key: {launch_template_key}")
+        # === Step 8: Launch new EC2 instance ===
+        subnet_to_use = random.choice(all_subnets) if all_subnets else None
+        print(f"Launching new instance in subnet: {subnet_to_use}")
 
         launch_params = {
             'LaunchTemplate': {
@@ -77,34 +102,45 @@ Write-Host "Starting HealthCoach auto-scale instance..."
                 ]
             }]
         }
-        print(f"Launch parameters: {json.dumps(launch_params)}")
 
-        response = ec2.run_instances(**launch_params)
-        print(f"EC2 run_instances response: {json.dumps(response)}")
+        if subnet_to_use:
+            launch_params['SubnetId'] = subnet_to_use
 
-        instance_id = response['Instances'][0]['InstanceId']
-        print(f"Created new HealthCoach instance: {instance_id}")
+        print(f"Launching instance with params: {json.dumps(launch_params)}")
+        ec2_response = ec2.run_instances(**launch_params)
+        instance_id = ec2_response['Instances'][0]['InstanceId']
+        print(f"✅ Created new EC2 instance: {instance_id}")
 
-        # Step 5: Wait for IP
-        def get_instance_details(instance_id, max_wait=20):
+        # === Step 9: Fetch instance IPs ===
+        def get_instance_details(instance_id, max_wait=30):
             waited = 0
             while waited < max_wait:
-                print(f"Checking instance details... waited={waited}s")
+                print(f"Waiting for instance details... {waited}s elapsed")
                 desc = ec2.describe_instances(InstanceIds=[instance_id])
                 instance = desc['Reservations'][0]['Instances'][0]
                 public_ip = instance.get('PublicIpAddress')
                 private_ip = instance.get('PrivateIpAddress')
                 state = instance['State']['Name']
-                print(f"State: {state}, PublicIP: {public_ip}, PrivateIP: {private_ip}")
                 if public_ip:
                     return public_ip, private_ip, state
-                time.sleep(2)
-                waited += 2
-            return instance.get('PublicIpAddress', 'Pending'), instance.get('PrivateIpAddress', 'N/A'), instance['State']['Name']
+                time.sleep(3)
+                waited += 3
+            return 'Pending', 'N/A', 'Unknown'
 
         public_ip, private_ip, state = get_instance_details(instance_id)
-        print(f"Instance ready: ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
+        print(f"Instance ready — ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
 
+        # === Step 10: Update DynamoDB (optional) ===
+        if len(response['Items']) > 0:
+            item_key = response['Items'][0]['id'] if 'id' in response['Items'][0] else response['Items'][0]['TargetGroup']
+            print(f"Updating DynamoDB slot with InstanceID={instance_id}")
+            table.update_item(
+                Key={'TargetGroup': item_key},
+                UpdateExpression="SET InstanceID = :iid",
+                ExpressionAttributeValues={':iid': instance_id}
+            )
+
+        # === Step 11: Return result ===
         return {
             'statusCode': 200,
             'body': json.dumps({
@@ -117,8 +153,5 @@ Write-Host "Starting HealthCoach auto-scale instance..."
         }
 
     except Exception as e:
-        print(f"❌ Error creating instance: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f'Error creating instance: {str(e)}')
-        }
+        print(f"❌ ERROR: {str(e)}")
+        return {'statusCode': 500, 'body': json.dumps(f'Error creating instance: {str(e)}')}
