@@ -3,7 +3,6 @@ import boto3
 import os
 import random
 import base64
-import time
 from boto3.dynamodb.conditions import Attr
 
 def lambda_handler(event, context):
@@ -94,11 +93,6 @@ Write-Host "Setup complete."
         available_slots = len(response['Items'])
         print(f"✅ DynamoDB available slots: {available_slots}")
 
-        if available_slots == 0:
-            print("⚠️ No available slots found — creating new instance anyway.")
-        else:
-            print("✅ Found free slot — will assign instance after creation.")
-
         # === Step 9: Launch new EC2 instance ===
         subnet_to_use = random.choice(all_subnets) if all_subnets else None
         print(f"🧭 Launching new instance in subnet: {subnet_to_use}")
@@ -130,26 +124,7 @@ Write-Host "Setup complete."
         instance_id = ec2_response['Instances'][0]['InstanceId']
         print(f"✅ EC2 Instance created: {instance_id}")
 
-        # === Step 10: Fetch instance IPs ===
-        def get_instance_details(instance_id, max_wait=45):
-            waited = 0
-            while waited < max_wait:
-                desc = ec2.describe_instances(InstanceIds=[instance_id])
-                instance = desc['Reservations'][0]['Instances'][0]
-                public_ip = instance.get('PublicIpAddress')
-                private_ip = instance.get('PrivateIpAddress')
-                state = instance['State']['Name']
-                if public_ip:
-                    return public_ip, private_ip, state
-                print(f"⏳ Waiting for instance public IP... ({waited}s elapsed)")
-                time.sleep(3)
-                waited += 3
-            return 'Pending', 'N/A', 'Unknown'
-
-        public_ip, private_ip, state = get_instance_details(instance_id)
-        print(f"✅ Instance ready: ID={instance_id}, PrivateIP={private_ip}, PublicIP={public_ip}, State={state}")
-
-        # === Step 11: Update DynamoDB if slot exists ===
+        # === Step 10: Update DynamoDB if slot exists ===
         if available_slots > 0:
             item_key = response['Items'][0].get('id') or response['Items'][0].get('TargetGroup')
             print(f"📝 Updating DynamoDB slot with InstanceID={instance_id} for key={item_key}")
@@ -159,15 +134,12 @@ Write-Host "Setup complete."
                 ExpressionAttributeValues={':iid': instance_id}
             )
 
-        # === Step 12: Success response ===
+        # === Step 11: Success response ===
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'message': '✅ New HealthCoach instance created successfully',
-                'InstanceId': instance_id,
-                'PrivateIp': private_ip,
-                'PublicIp': public_ip,
-                'State': state
+                'InstanceId': instance_id
             })
         }
 
