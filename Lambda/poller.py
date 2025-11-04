@@ -1,138 +1,150 @@
+# This function polls the SQS queue for new session requests and checks
+# if a Signalling instance is available to service the request or needs to be created.
+# It should be triggered on a schedule (e.g., every minute via CloudWatch Event).
+
 import boto3
 import json
 import os
+import logging
 import urllib.request
 import urllib.error
 
+# Configure logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
 def lambda_handler(event, context):
-    print("=== 🚀 Poller Lambda started ===")
-    print(f"📥 Incoming event: {json.dumps(event)}")
+    logger.info("=== START: Poller Lambda ===")
+    logger.info(f"Incoming event: {json.dumps(event)}")
 
-    try:
-        # --- Initialize Lambda client ---
-        lambdaFunc = boto3.client('lambda')
-        print("✅ Initialized boto3 Lambda client")
+    # Initialize boto3 Lambda client
+    lambdaFunc = boto3.client('lambda')
+    logger.info("Initialized boto3 Lambda client")
 
-        # --- Retrieve ARNs dynamically ---
-        print("🔍 Fetching ARNs for other Lambdas...")
-        sendSession = lambdaFunc.get_function(FunctionName='HealthCoach-sendSessionDetails')
-        lambdaArnSendSesionDetails = sendSession['Configuration']['FunctionArn']
-        print(f"📦 sendSessionDetails ARN: {lambdaArnSendSesionDetails}")
+    # Retrieve ARNs for dependent Lambdas
+    logger.info("Fetching ARNs for dependent Lambdas...")
 
-        createInstances = lambdaFunc.get_function(FunctionName='HealthCoach-createInstances')
-        lambdaArnCreateInstances = createInstances['Configuration']['FunctionArn']
-        print(f"⚙️ createInstances ARN: {lambdaArnCreateInstances}")
+    response = lambdaFunc.get_function(FunctionName='HealthCoach-sendSessionDetails')
+    lambdaArnSendSessionDetails = response['Configuration']['FunctionArn']
+    logger.info(f"sendSessionDetails ARN: {lambdaArnSendSessionDetails}")
 
-        keepAlive = lambdaFunc.get_function(FunctionName='HealthCoach-keepConnectionAlive')
-        lambdaArnKeepAlive = keepAlive['Configuration']['FunctionArn']
-        print(f"🔌 keepConnectionAlive ARN: {lambdaArnKeepAlive}")
+    response = lambdaFunc.get_function(FunctionName='HealthCoach-createInstances')
+    lambdaArnCreateInstances = response['Configuration']['FunctionArn']
+    logger.info(f"createInstances ARN: {lambdaArnCreateInstances}")
 
-        # --- Get matchmaker secret from SSM ---
-        print("🔐 Fetching matchmaker client secret from SSM Parameter Store...")
-        ssm = boto3.client('ssm')
-        parameter = ssm.get_parameter(Name='HealthCoach-ClientSecret')
-        matchmakersecret = parameter['Parameter']['Value']
-        print("✅ Successfully retrieved matchmaker secret")
+    response = lambdaFunc.get_function(FunctionName='HealthCoach-keepConnectionAlive')
+    lambdaArnKeepAlive = response['Configuration']['FunctionArn']
+    logger.info(f"keepConnectionAlive ARN: {lambdaArnKeepAlive}")
 
-        # --- Connect to SQS ---
-        sqs_name = os.environ.get("SQSName")
-        print(f"📦 Connecting to SQS queue: {sqs_name}")
+    # Retrieve MatchMaker client secret from SSM
+    ssm = boto3.client('ssm')
+    logger.info("Fetching MatchMaker client secret from SSM...")
+    parameter = ssm.get_parameter(Name='HealthCoach-ClientSecret')
+    matchmakersecret = parameter['Parameter']['Value']
+    logger.info("Successfully retrieved MatchMaker client secret")
 
-        sqs = boto3.resource('sqs')
-        client = boto3.client('sqs')
-        print("✅ Initialized SQS resource")
+    # Connect to SQS
+    sqs = boto3.resource('sqs')
+    queue_name = os.environ["SQSName"]
+    logger.info(f"Connecting to SQS queue: {queue_name}")
+    queue = sqs.get_queue_by_name(QueueName=queue_name)
+    logger.info(f"Connected to SQS queue URL: {queue.url}")
 
-        queues = client.list_queues()
-        print(f"🧾 Queues visible to Lambda: {queues.get('QueueUrls', [])}")
+    # Receive messages
+    messages = queue.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=2)
+    logger.info(f"Received {len(messages)} messages from SQS")
 
-        queue = sqs.get_queue_by_name(QueueName=sqs_name)
-        print(f"✅ Connected to SQS queue successfully: {queue.url}")
+    for message in messages:
+        logger.info(f"Processing message body: {message.body}")
 
-        messages = queue.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=2)
-        print(f"📨 Received {len(messages)} messages from queue")
+        try:
+            payload = json.loads(message.body)
+        except Exception as e:
+            logger.error(f"Failed to parse message body: {str(e)}")
+            continue
 
-        if len(messages) == 0:
-            print("⚠️ No new messages found in SQS.")
-        else:
-            for message in messages:
-                print(f"🧩 Processing message body: {message.body}")
-                payload = json.loads(message.body)
-                print(f"📤 Parsed payload: {json.dumps(payload)}")
+        # Step 1: Send a keep-alive signal to the frontend
+        logger.info("Invoking keepConnectionAlive Lambda...")
+        lambdaFunc.invoke(
+            FunctionName=lambdaArnKeepAlive,
+            InvocationType='Event',
+            Payload=json.dumps(payload)
+        )
+        logger.info("keepConnectionAlive invoked successfully")
 
-                # --- Invoke keepConnectionAlive Lambda ---
-                print("🔁 Invoking keepConnectionAlive Lambda...")
+        # Step 2: Log connection details
+        connection_id = payload.get("connectionId", "Unknown")
+        matchmaker_url = os.environ["MatchMakerURL"]
+        logger.info(f"Connection ID: {connection_id}")
+        logger.info(f"MatchMaker URL: {matchmaker_url}")
+        logger.info(f"Client Secret: {matchmakersecret}")
+
+        # Step 3: Check with MatchMaker for available Signalling servers
+        try:
+            logger.info("Sending GET request to MatchMaker...")
+
+            request = urllib.request.Request(
+                url=matchmaker_url,
+                headers={"clientsecret": matchmakersecret},
+                method='GET'
+            )
+
+            logger.info(f"Request prepared: URL={request.full_url}, Headers={request.header_items()}")
+
+            response = urllib.request.urlopen(request, timeout=10)
+            logger.info(f"MatchMaker response status: {response.status}")
+
+            if response.status == 200:
+                responsePayload = response.read()
+                JSON_object = json.loads(responsePayload.decode("utf-8"))
+                logger.info(f"MatchMaker response JSON: {json.dumps(JSON_object)}")
+
+                # Merge MatchMaker data into the original payload
+                payload.update(JSON_object)
+
+                # Step 4: Invoke sendSessionDetails Lambda
+                logger.info("Invoking sendSessionDetails Lambda...")
                 lambdaFunc.invoke(
-                    FunctionName=lambdaArnKeepAlive,
+                    FunctionName=lambdaArnSendSessionDetails,
                     InvocationType='Event',
                     Payload=json.dumps(payload)
                 )
-                print("✅ keepConnectionAlive Lambda invoked successfully")
+                logger.info("sendSessionDetails Lambda invoked successfully")
 
-                connection_id = payload.get('connectionId')
-                print(f"🔗 Connection ID: {connection_id}")
+                # Delete the processed message
+                delete_response = message.delete()
+                logger.info(f"Deleted message from SQS after successful processing. Response: {delete_response}")
 
-                # --- Contact MatchMaker ---
-                matchmaker_url = os.environ.get("MatchMakerURL")
-                print(f"🌐 Contacting MatchMaker: {matchmaker_url}")
-                print("🧾 Sending request with clientsecret from SSM")
+            else:
+                logger.warning(f"Unexpected MatchMaker status code: {response.status}")
+                delete_response = message.delete()
+                logger.info(f"Deleted message from SQS after unexpected status. Response: {delete_response}")
 
-                try:
-                    request = urllib.request.Request(
-                        url=matchmaker_url,
-                        headers={"clientsecret": matchmakersecret},
-                        method='GET'
-                    )
+        except urllib.error.HTTPError as err:
+            logger.error(f"HTTPError while contacting MatchMaker: {err.code} - {err.reason}")
+            if err.code == 400:
+                logger.info("No signalling servers available — invoking createInstances Lambda")
 
-                    response = urllib.request.urlopen(request, timeout=10)
-                    print(f"✅ MatchMaker response status: {response.status}")
+                inputParams = {"startAllServers": False}
+                lambdaFunc.invoke(
+                    FunctionName=lambdaArnCreateInstances,
+                    InvocationType='Event',
+                    Payload=json.dumps(inputParams)
+                )
+                logger.info("createInstances Lambda invoked to start new server instance")
+                # Message not deleted here, will be retried next poll
 
-                    if response.status == 200:
-                        response_payload = response.read()
-                        json_data = json.loads(response_payload.decode("utf-8"))
-                        print(f"📦 MatchMaker JSON response: {json.dumps(json_data)}")
+            else:
+                logger.error(f"Unhandled HTTP error: {err}")
+                raise err
 
-                        # Merge with payload and invoke sendSessionDetails
-                        payload.update(json_data)
+        except Exception as e:
+            logger.error(f"General exception during MatchMaker communication: {str(e)}")
+            raise e
 
-                        print("🚀 Invoking sendSessionDetails Lambda...")
-                        lambdaFunc.invoke(
-                            FunctionName=lambdaArnSendSesionDetails,
-                            InvocationType='Event',
-                            Payload=json.dumps(payload)
-                        )
-                        print("✅ sendSessionDetails Lambda invoked successfully")
+    logger.info("=== END: Poller Lambda completed successfully ===")
 
-                        # Delete processed message
-                        message.delete()
-                        print("🗑️ Deleted message from SQS after successful processing")
-
-                    else:
-                        print(f"⚠️ Unexpected MatchMaker status code: {response.status}")
-
-                except urllib.error.HTTPError as err:
-                    print(f"❌ HTTPError from MatchMaker: {err.code} - {err.reason}")
-                    if err.code == 400:
-                        print("⚙️ No signalling servers available — invoking createInstances Lambda")
-                        inputParams = {"startAllServers": False}
-                        lambdaFunc.invoke(
-                            FunctionName=lambdaArnCreateInstances,
-                            InvocationType='Event',
-                            Payload=json.dumps(inputParams)
-                        )
-                        print("✅ createInstances Lambda invoked successfully to spawn new servers")
-                    else:
-                        raise err
-
-        print("=== ✅ Poller Lambda completed successfully ===")
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps('Poller completed scanning and processing messages')
-        }
-
-    except Exception as e:
-        print(f"❌ Poller error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f"Poller error: {str(e)}")
-        }
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Completed scanning for incoming requests')
+    }
